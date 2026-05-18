@@ -1,0 +1,291 @@
+---
+title: "Survival After Myocardial Infarction: A Reproducible Re-Analysis"
+subtitle: "How an inverted event indicator manufactured significant findings"
+author: "Tyler Tschanz"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 7, fig.height = 4.5)
+
+root <- normalizePath(file.path(dirname(knitr::current_input(dir = TRUE)), ".."))
+source(file.path(root, "R", "echo_survival.R"))
+library(knitr)
+
+raw      <- load_echocardiogram(file.path(root, "data", "echocardiogram_raw.csv"))
+prep     <- prepare_survival_data(raw)
+dat      <- prep$cohort
+model_df <- prep$model
+plog     <- prep$log
+co       <- summarise_cohort(dat)
+
+km_pe  <- fit_km(dat, "pericardial_effusion")
+lr_pe  <- logrank(dat, "pericardial_effusion")
+kc_pe  <- km_counts(dat, "pericardial_effusion")
+km_wmi <- fit_km(dat, "wmi_group")
+lr_wmi <- logrank(dat, "wmi_group")
+kc_wmi <- km_counts(dat, "wmi_group")
+
+kc_line <- function(kc) sprintf(
+  "n = %d (%d deaths, %d censored; %d excluded for a missing grouping value)",
+  kc$n_used, kc$events, kc$censored, kc$n_missing_group)
+
+cox <- fit_cox(model_df)
+hr  <- tidy_hazard_ratios(cox)
+ph  <- check_ph(cox)
+cstat <- summary(cox)$concordance[["C"]]
+lrt   <- summary(cox)$logtest
+
+fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
+```
+
+## Summary
+
+This project re-analyses the public UCI Echocardiogram cohort
+(`r co$n` patients followed after myocardial infarction) using
+time-to-event methods. Its purpose is methodological. A prior version of
+this analysis defined the survival event as *being alive* rather than
+*death*, an inverted indicator that fabricated strong, statistically
+significant associations. With the event coded correctly, **those
+associations disappear**: no echocardiographic variable significantly
+predicts survival in this small cohort. The value here is the
+demonstration of correct survival methodology and the discipline to
+report a null result rather than a convenient one.
+
+## The methodological error
+
+In this dataset the status field `still_alive` is `1` when the patient
+was alive at last contact (a **right-censored** observation) and `0` when
+the patient **died** (the event of interest). The survival object must
+therefore be built with the event equal to `still_alive == 0`.
+
+The prior analysis used:
+
+```r
+Surv(time = survival, event = still_alive)   # WRONG: alive coded as the event
+```
+
+This treats survivors as having experienced the event and decedents as
+censored. The resulting Kaplan-Meier curves, log-rank tests, and Cox
+model all estimate the hazard of *remaining alive*, which is not a
+meaningful quantity. Because the scrambled event/censoring structure
+remained correlated with the covariates, the broken model still produced
+small p-values, which were then interpreted as clinical findings. The
+correct specification is:
+
+```r
+Surv(time = survival_months, event = (still_alive == 0))
+```
+
+Every result below uses the correct specification.
+
+## Data and provenance
+
+The UCI Echocardiogram dataset records survival time, vital status, and
+echocardiographic measurements for patients after a heart attack. It is
+public, de-identified, and distributed under CC BY 4.0
+(DOI 10.24432/C5QW24); the `name` field is a constant placeholder. Four
+source columns are excluded from analysis: the raw wall-motion score
+(superseded by the index), an undocumented derivative field (`mult`),
+the documented-meaningless `group` field, and `alive_at_1yr`. The last
+is a **post-outcome derived label**: it is determined by survival time
+and status at 12 months, so using it to predict survival would be target
+leakage.
+
+The source file contains one structurally malformed record (line 50: a
+spurious leading comma yields 14 fields instead of 13). A lenient
+`read.csv` would silently wrap that line across two rows and corrupt the
+values, the same class of quiet data defect this project exists to
+expose. Ingestion therefore validates the field count of every line and
+**excludes** the malformed record explicitly rather than guessing at it.
+
+```{r prep-table}
+data.frame(
+  Step = c("Source records",
+           sprintf("Excluded: malformed (line %s)",
+                   paste(plog$malformed_lines, collapse = ", ")),
+           "Well-formed records",
+           "Removed: missing or invalid time/status",
+           "Analysis cohort (Kaplan-Meier, log-rank)",
+           "Removed: missing model covariate",
+           "Complete-case cohort (Cox model)"),
+  n = c(plog$n_source, plog$n_malformed, plog$n_wellformed,
+        plog$n_dropped_outcome, plog$n_valid_outcome,
+        plog$n_dropped_covariate, plog$n_complete_case)
+) |> kable(caption = "Cohort derivation, from raw source file to model.")
+```
+
+## Cohort
+
+```{r cohort-table}
+data.frame(
+  Measure = c("Patients", "Deaths (events)", "Censored (alive)",
+              "Median survival (Kaplan-Meier)", "Median follow-up",
+              "Age at infarction, mean (SD)"),
+  Value = c(
+    co$n,
+    sprintf("%d (%.1f%%)", co$events, 100 * co$events / co$n),
+    co$censored,
+    ifelse(is.na(co$median_survival), "not reached",
+           sprintf("%.0f months", co$median_survival)),
+    ifelse(is.na(co$median_followup),
+           sprintf("not reached (max %.0f months)", co$max_followup),
+           sprintf("%.1f months", co$median_followup)),
+    sprintf("%.1f (%.1f)", co$age_mean, co$age_sd)
+  )
+) |> kable(caption = "Cohort and censoring summary.")
+```
+
+This is a high-mortality cohort: `r co$events` of `r co$n` patients
+(`r sprintf("%.0f%%", 100 * co$events / co$n)`) died during follow-up.
+Median follow-up is reported by the reverse Kaplan-Meier estimator, the
+correct estimator for follow-up time; it is not reached because fewer
+than half the patients are censored.
+
+## Kaplan-Meier analysis
+
+### By pericardial effusion
+
+`r kc_line(kc_pe)`.
+
+```{r km-pe}
+km_plot(km_pe, "Survival by pericardial effusion", "Pericardial effusion")
+risk_table(km_pe, times = c(0, 12, 24, 36, 48)) |>
+  kable(caption = "Number at risk.")
+```
+
+The curves overlap and there is no statistically significant difference
+(log-rank &chi;&sup2; = `r sprintf("%.2f", lr_pe$chisq)`,
+p = `r fmt_p(lr_pe$p_value)`).
+
+### By wall-motion index
+
+A pre-specified, clinically interpretable split is used for display
+only: an index of 1.0 means every visualised segment was normal, and a
+value above 1.0 indicates abnormal wall motion. The Cox model below keeps
+the index continuous and applies no cut-point.
+
+`r kc_line(kc_wmi)`.
+
+```{r km-wmi}
+km_plot(km_wmi, "Survival by wall-motion index", "Wall-motion index")
+risk_table(km_wmi, times = c(0, 12, 24, 36, 48)) |>
+  kable(caption = "Number at risk.")
+```
+
+Again there is no statistically significant difference (log-rank
+&chi;&sup2; = `r sprintf("%.2f", lr_wmi$chisq)`,
+p = `r fmt_p(lr_wmi$p_value)`).
+
+## Cox proportional-hazards model
+
+A multivariable Cox model was fitted on the `r plog$n_complete_case`
+complete cases (`r summary(cox)$nevent` deaths) with age, pericardial
+effusion, fractional shortening, E-point septal separation, left
+ventricular diastolic dimension, and the continuous wall-motion index.
+
+```{r cox-table}
+data.frame(
+  Term = hr$term,
+  `Hazard ratio (95% CI)` = sprintf("%.2f (%.2f-%.2f)",
+                                    hr$hazard_ratio, hr$ci_low, hr$ci_high),
+  p = vapply(hr$p_value, fmt_p, character(1)),
+  check.names = FALSE
+) |> kable(caption = "Multivariable Cox hazard ratios.")
+```
+
+No covariate reaches significance. The model's discrimination is
+effectively chance (Harrell's C = `r sprintf("%.3f", cstat)`) and it does
+not improve on the null model (likelihood-ratio test
+p = `r fmt_p(lrt[["pvalue"]])`). The wide confidence intervals are
+consistent with a small sample and few events per variable.
+
+### Proportional-hazards assumption
+
+```{r ph-table}
+data.frame(
+  Term = ph$table$term,
+  chisq = round(ph$table$chisq, 2),
+  df = ph$table$df,
+  p = vapply(ph$table$p, fmt_p, character(1)),
+  check.names = FALSE
+) |> kable(caption = "Scaled Schoenfeld residual test (cox.zph).")
+```
+
+The global test (p = `r fmt_p(ph$global_p)`) and every per-term test are
+non-significant, so there is **no evidence of a proportional-hazards
+violation** (which is not the same as proving the assumption holds). It
+is also largely moot here: there is no effect to model.
+
+## Interpretation
+
+With the event indicator corrected, the previously reported "significant
+predictors of survival" vanish entirely. The honest conclusion is the
+absence of a finding: in this small, single-source cohort there is **no
+statistically significant evidence** that these echocardiographic
+measurements stratify post-infarction survival, and the multivariable
+Cox model shows no discriminative ability. This is *absence of evidence*,
+not evidence of absence: the cohort is small and underpowered, so a true
+moderate effect could easily go undetected. What can be said firmly is
+the negative methodological result, that the earlier significant findings
+were artifacts of the inverted event coding rather than clinical signal.
+
+This is the intended result. The objective was not to find predictors;
+it was to apply survival methodology correctly and report what the data
+actually support.
+
+## Limitations
+
+- **Time origin and predictor timing.** The time scale is months since
+  myocardial infarction, but the dataset does not document *when* each
+  echocardiogram was performed relative to the infarction. If imaging
+  occurred at variable, post-infarction times, patients had to survive
+  to be measured, which introduces survivor / immortal-time bias. These
+  results must therefore be read as a descriptive, retrospective
+  association exercise, **not** as causal or prospective clinical
+  prediction.
+- Small cohort (`r co$n` patients; `r plog$n_complete_case` complete
+  cases) with few events per covariate, so confidence intervals are wide
+  and the study is underpowered for modest effects (absence of evidence,
+  not evidence of absence).
+- Single-source observational data with documented quality issues
+  (one malformed source record, placeholder/meaningless columns, missing
+  values).
+- The wall-motion dichotomy is for visualisation only and is not used
+  for inference.
+- No external validation cohort; findings describe this dataset only.
+
+## Reproducibility
+
+The analysis logic lives in `R/echo_survival.R`. Both the command-line
+runner (`R/run_analysis.R`) and this report source that single file, so
+the script and the report cannot disagree. `tests/test_pipeline.R`
+asserts the correct event coding and the expected row counts at every
+filtering step, so a regression in either fails loudly. Re-run end to
+end with:
+
+```sh
+Rscript R/run_analysis.R          # console summary + figures
+Rscript tests/test_pipeline.R     # assertions (non-zero exit on failure)
+Rscript -e 'rmarkdown::render("report/survival_analysis.Rmd")'
+```
+
+```{r session, echo=TRUE}
+sessionInfo()
+```
+
+## References
+
+Salzberg, S. (1988). *Echocardiogram* [Data set]. UCI Machine Learning
+Repository. CC BY 4.0. DOI 10.24432/C5QW24.
+https://archive.ics.uci.edu/dataset/38/echocardiogram
+
+Therneau, T. (2024). *A Package for Survival Analysis in R*. R package
+version 3.x. https://CRAN.R-project.org/package=survival

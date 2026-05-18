@@ -1,0 +1,15 @@
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# knitr / rmarkdown intermediates (the standalone HTML is self-contained)
+report/*_files/
+report/*_cache/
+*.knit.md
+*.utf8.md
+
+# OS
+.DS_Store
+Thumbs.db

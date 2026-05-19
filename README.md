@@ -5,6 +5,8 @@ as a **methodological case study**: it shows how an inverted event
 indicator can manufacture statistically significant findings, and what
 the data actually support once the analysis is done correctly.
 
+**Rendered report:** https://t-tschanz.github.io/echocardiogram-survival-analysis/
+
 ## The point of this repo
 
 An earlier analysis of this dataset defined the survival event as a
